@@ -43,6 +43,8 @@ jobs:
       - name: Set up QEMU
         if: matrix.arch == 'arm64'
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Install Qt for AMD64
         if: matrix.arch == 'amd64'
@@ -54,11 +56,46 @@ jobs:
           arch: gcc_64
           modules: qtmultimedia qtserialport
 
-      - name: Install Qt for ARM64
+      - name: Install cross-compilation tools and Qt for ARM64
         if: matrix.arch == 'arm64'
         run: |
+          # Add ARM64 architecture
+          sudo dpkg --add-architecture arm64
+          
+          # Update sources.list to include ARM64 repositories
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-backports main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          
+          # Update package lists
           sudo apt-get update
-          sudo apt-get install -y qt6-base-dev qt6-multimedia-dev libqt6svg6-dev libqt6serialport6-dev libgl1-mesa-dev qt6-l10n-tools qt6-tools-dev qt6-tools-dev-tools
+          
+          # Install cross-compilation toolchain
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            pkg-config-aarch64-linux-gnu
+          
+          # Install ARM64 Qt packages and dependencies
+          sudo apt-get install -y \
+            qt6-base-dev:arm64 \
+            qt6-multimedia-dev:arm64 \
+            libqt6svg6-dev:arm64 \
+            libqt6serialport6-dev:arm64 \
+            libgl1-mesa-dev:arm64 \
+            libusb-1.0-0-dev:arm64 \
+            libssl-dev:arm64 \
+            qt6-l10n-tools \
+            qt6-tools-dev \
+            qt6-tools-dev-tools
+          
+          # Set up cross-compilation environment
+          echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          echo "STRIP=aarch64-linux-gnu-strip" >> $GITHUB_ENV
+          echo "PKG_CONFIG=aarch64-linux-gnu-pkg-config" >> $GITHUB_ENV
           echo "Qt6_DIR=/usr/lib/aarch64-linux-gnu/cmake/Qt6" >> $GITHUB_ENV
           echo "QTDIR=/usr/lib/aarch64-linux-gnu/qt6" >> $GITHUB_ENV
           echo "PATH=/usr/lib/qt6/bin:$PATH" >> $GITHUB_ENV
@@ -68,8 +105,16 @@ jobs:
           echo "PATH: $PATH"
           echo "Qt6_DIR: $Qt6_DIR"
           echo "QTDIR: $QTDIR"
+          echo "Architecture: ${{ matrix.arch }}"
           which lupdate || echo "lupdate not found"
           lupdate --version || echo "lupdate version check failed"
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            echo "Cross-compilation environment:"
+            echo "CC: $CC"
+            echo "CXX: $CXX"
+            echo "PKG_CONFIG: $PKG_CONFIG"
+            aarch64-linux-gnu-gcc --version || echo "ARM64 GCC not found"
+          fi
 
       - name: Get all tags for correct version determination
         working-directory: ${{ github.workspace }}
@@ -105,11 +150,84 @@ jobs:
       - name: Configure And Build
         working-directory: ${{ env.BUILD_DIR }}
         run: |
-          qmake6 ${{ github.workspace }} && make -j$(nproc)
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            echo "Configuring for ARM64 cross-compilation..."
+            
+            # Create qmake cross-compilation spec if it doesn't exist
+            SPEC_DIR="/usr/lib/qt6/mkspecs/linux-aarch64-gnu-g++"
+            if [ ! -d "$SPEC_DIR" ]; then
+              sudo mkdir -p "$SPEC_DIR"
+              sudo tee "$SPEC_DIR/qmake.conf" > /dev/null << 'EOF'
+#
+# qmake configuration for building with aarch64-linux-gnu-g++
+#
+
+MAKEFILE_GENERATOR      = UNIX
+CONFIG                 += incremental
+QMAKE_INCREMENTAL_STYLE = sublib
+
+include(../common/linux.conf)
+include(../common/gcc-base-unix.conf)
+include(../common/g++-unix.conf)
+
+# modifications to g++.conf
+QMAKE_CC                = aarch64-linux-gnu-gcc
+QMAKE_CXX               = aarch64-linux-gnu-g++
+QMAKE_LINK              = aarch64-linux-gnu-g++
+QMAKE_LINK_SHLIB        = aarch64-linux-gnu-g++
+
+# modifications to linux.conf
+QMAKE_AR                = aarch64-linux-gnu-ar cqs
+QMAKE_OBJCOPY           = aarch64-linux-gnu-objcopy
+QMAKE_NM                = aarch64-linux-gnu-nm -P
+QMAKE_STRIP             = aarch64-linux-gnu-strip
+load(qt_config)
+EOF
+              
+              sudo tee "$SPEC_DIR/qplatformdefs.h" > /dev/null << 'EOF'
+#include "../linux-g++/qplatformdefs.h"
+EOF
+            fi
+            
+            # Configure with cross-compilation
+            qmake6 ${{ github.workspace }} \
+              -spec linux-aarch64-gnu-g++ \
+              "CONFIG += cross_compile" \
+              "QMAKE_CC=aarch64-linux-gnu-gcc" \
+              "QMAKE_CXX=aarch64-linux-gnu-g++" \
+              "QMAKE_LINK=aarch64-linux-gnu-g++" \
+              "PKG_CONFIG=aarch64-linux-gnu-pkg-config"
+          else
+            echo "Configuring for AMD64..."
+            qmake6 ${{ github.workspace }}
+          fi
+          
+          echo "Building..."
+          make -j$(nproc)
+          
           echo "Checking build output:"
           ls -lh ${{ env.BUILD_DIR }}
           if [ -f ${{ env.BUILD_DIR }}/openterfaceQT ]; then
             echo "openterfaceQT found!"
+            file ${{ env.BUILD_DIR }}/openterfaceQT
+            echo "Binary architecture verification:"
+            if [ "${{ matrix.arch }}" == "arm64" ]; then
+              if file ${{ env.BUILD_DIR }}/openterfaceQT | grep -q "aarch64\|ARM aarch64"; then
+                echo "✅ ARM64 binary successfully built"
+              else
+                echo "❌ ERROR: Expected ARM64 binary but got:"
+                file ${{ env.BUILD_DIR }}/openterfaceQT
+                exit 1
+              fi
+            else
+              if file ${{ env.BUILD_DIR }}/openterfaceQT | grep -q "x86-64\|x86_64"; then
+                echo "✅ AMD64 binary successfully built"
+              else
+                echo "❌ ERROR: Expected AMD64 binary but got:"
+                file ${{ env.BUILD_DIR }}/openterfaceQT
+                exit 1
+              fi
+            fi
           else
             echo "Error: openterfaceQT not found in ${{ env.BUILD_DIR }}!"
             exit 1
@@ -122,8 +240,15 @@ jobs:
           
           PKG_NAME="${{ env.ARTIFACT }}.linux.${{ matrix.arch }}"
           
+          # Map architecture names for Debian packaging
+          if [ "${{ matrix.arch }}" == "amd64" ]; then
+            DEB_ARCH="amd64"
+          elif [ "${{ matrix.arch }}" == "arm64" ]; then
+            DEB_ARCH="arm64"
+          fi
+          
           sed -e "s/\${VERSION}/${{ env.VERSION }}/g" \
-              -e "s/\${ARCH}/${{ matrix.arch }}/g" \
+              -e "s/\${ARCH}/$DEB_ARCH/g" \
               ${{ github.workspace }}/packaging/debian/control > package/DEBIAN/control
           
           mkdir -p package/usr/bin
@@ -146,6 +271,24 @@ jobs:
 
           mv package $PKG_NAME
           dpkg-deb --build $PKG_NAME
+          
+          # Verify the package contains the correct architecture binary
+          echo "Verifying package contents:"
+          dpkg-deb -c $PKG_NAME.deb | grep openterfaceQT
+          dpkg-deb -x $PKG_NAME.deb verification_tmp
+          file verification_tmp/usr/bin/openterfaceQT
+          
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            if file verification_tmp/usr/bin/openterfaceQT | grep -q "aarch64\|ARM aarch64"; then
+              echo "✅ DEB package contains correct ARM64 binary"
+            else
+              echo "❌ ERROR: DEB package contains wrong architecture:"
+              file verification_tmp/usr/bin/openterfaceQT
+              exit 1
+            fi
+          fi
+          
+          rm -rf verification_tmp
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -167,25 +310,41 @@ jobs:
           
           # Debug: Verify files in SOURCES
           ls -lh rpmbuild/SOURCES/
+          file rpmbuild/SOURCES/openterfaceQT
+          
+          # Map architecture names for RPM packaging
+          if [ "${{ matrix.arch }}" == "amd64" ]; then
+            RPM_ARCH="x86_64"
+          elif [ "${{ matrix.arch }}" == "arm64" ]; then
+            RPM_ARCH="aarch64"
+          fi
           
           # Generate spec file with version and architecture substitutions
           sed -e "s/\${VERSION}/${{ env.VERSION }}/g" \
-              -e "s/\${ARCH}/${{ matrix.arch }}/g" \
+              -e "s/\${ARCH}/$RPM_ARCH/g" \
               ${{ github.workspace }}/packaging/rpm/spec > rpmbuild/SPECS/openterfaceqt.spec
           
           # Debug: Show generated spec file
           cat rpmbuild/SPECS/openterfaceqt.spec
           
-          # Build RPM
-          rpmbuild --define "_topdir ${{ runner.temp }}/rpmbuild" -bb rpmbuild/SPECS/openterfaceqt.spec
+          # Build RPM with target architecture
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            rpmbuild --define "_topdir ${{ runner.temp }}/rpmbuild" --target aarch64 -bb rpmbuild/SPECS/openterfaceqt.spec
+          else
+            rpmbuild --define "_topdir ${{ runner.temp }}/rpmbuild" -bb rpmbuild/SPECS/openterfaceqt.spec
+          fi
           
           # Copy the resulting RPM
           find rpmbuild/RPMS -name "*.rpm" -exec cp {} ./$PKG_NAME.rpm \;
+          
+          # Verify the RPM contains the correct architecture binary
+          echo "Verifying RPM contents:"
+          rpm -qlp $PKG_NAME.rpm | grep openterfaceQT || true
+          rpm2cpio $PKG_NAME.rpm | cpio -t | grep openterfaceQT || true
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
           name: openterfaceQT.linux.${{ matrix.arch }}.rpm
           path: ${{ runner.temp }}/${{ env.ARTIFACT }}.linux.${{ matrix.arch }}.rpm
-
           if-no-files-found: error
